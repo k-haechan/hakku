@@ -1,477 +1,221 @@
-# 학꾸 (Hakku)
+# 학꾸 (Hakku) — 결제·스토리지 보안·챗봇 파트
 
-AI 퍼스널컬러 기반 꾸미기 아이템 추천 커머스·커뮤니티 플랫폼.
+> 이 저장소는 SSAFY 팀 프로젝트 **[학꾸(Hakku)](https://github.com/hakku-ssafy/hakku)** 의 fork로,
+> **김해찬**([@k-haechan](https://github.com/k-haechan))이 설계·리뷰를 주도한 영역을 중심으로 재정리한 문서입니다.
+> 팀 전체 아키텍처(AI 진단 파이프라인·벤치마크 등)는 [원본 팀 README](README.team.md) 또는
+> [원본 저장소](https://github.com/hakku-ssafy/hakku)를 참고하세요.
 
-사용자가 얼굴 사진을 업로드하면 AI가 16종 퍼스널컬러를 진단하고, 진단 결과와 활동 이력을 바탕으로 스티커·뱃지·꾸미기 아이템을 개인화 추천한다. 토스페이먼츠 결제, AI 고객센터 챗봇, 마크다운 매거진, 학생증 자랑 커뮤니티까지 하나의 폴리글랏 마이크로서비스 스택으로 묶었다.
-
----
-
-## 아키텍처
-
-Nginx 리버스 프록시 뒤에 6개 애플리케이션 서비스가 독립 실행되는 폴리글랏 마이크로서비스 구조. 비즈니스 로직은 Spring(`main`·`payment`), AI 추론은 FastAPI(`ai`·`chatbot`), 이미지 입출력은 Go(`storage`)가 담당한다.
-
-```mermaid
-graph TD
-    Client["🌐 클라이언트"]
-
-    subgraph proxy["Nginx :19001"]
-        N["/ → frontend<br>/api/ → main-server<br>/api/payments → payment-server<br>/ai/ → ai-server<br>/chat/ → chatbot-server (SSE)<br>/storage/ → storage-server"]
-    end
-
-    subgraph app["애플리케이션"]
-        FE["Frontend\nVue 3 · TypeScript · Tailwind"]
-        MS["Main Server\nSpring Boot 4 · Java 17"]
-        PAY["Payment Server\nSpring Boot 4 · Java 17"]
-        AI["AI Server\nFastAPI · Python 3.13"]
-        CB["Chatbot Server\nFastAPI · OpenAI"]
-        ST["Storage Server\nGo (표준 라이브러리)"]
-    end
-
-    subgraph infra["인프라"]
-        PG[("PostgreSQL 16")]
-        RD[("Redis 7")]
-        KF["Kafka 3.7\n(KRaft)"]
-    end
-
-    subgraph ext["외부"]
-        OAI["OpenAI"]
-        TOSS["토스페이먼츠"]
-    end
-
-    subgraph obs["관측성"]
-        PR["Prometheus"]
-        GF["Grafana :3000"]
-        JG["Jaeger :16686"]
-    end
-
-    Client --> proxy
-    proxy -->|"/"| FE
-    proxy -->|"/api/"| MS
-    proxy -->|"/api/payments"| PAY
-    proxy -->|"/ai/"| AI
-    proxy -->|"/chat/"| CB
-    proxy -->|"/storage/"| ST
-
-    MS --> PG & RD & KF
-    PAY --> PG & RD & KF
-    PAY -->|"결제 승인"| TOSS
-    AI -->|"진단 결과 반영"| MS
-    AI -->|"이미지 저장·조회"| ST
-    AI --> OAI
-    CB -->|"대화 기억"| RD
-    CB -->|"고객센터 도구"| MS
-    CB --> OAI
-    KF -->|"payment.approved"| MS
-
-    MS -->|"/metrics"| PR
-    AI -->|"/metrics"| PR
-    ST -->|"/metrics"| PR
-    PR --> GF
-    MS -->|"traces"| JG
-```
-
-| 서비스 | 스택 | 책임 |
-|---|---|---|
-| `frontend` | Vue 3 + Vite + TypeScript + Tailwind + Pinia | 사용자 화면 |
-| `main-server` | Spring Boot 4.0.6 (Java 17) | 회원·인증·커뮤니티·매거진·상품·주문·추천·알림 |
-| `payment-server` | Spring Boot 4.0.6 (Java 17) | 토스페이먼츠 결제 승인·웹훅·Outbox 이벤트 발행 |
-| `ai-server` | FastAPI (Python 3.13) | 퍼스널컬러 진단, OpenAI 연동 |
-| `chatbot-server` | FastAPI (Python) + OpenAI | AI 고객센터 챗봇 (SSE 스트리밍·function-calling) |
-| `storage-server` | Go 1.24 (표준 라이브러리) | 이미지 저장·서빙 |
-
-**지원 인프라** — PostgreSQL · Redis · Kafka (KRaft) · Prometheus · Grafana · Jaeger
-
-> `payment-server`는 `main-server`와 동일한 `hakku` PostgreSQL DB를 공유하되 Flyway 이력 테이블(`flyway_schema_history_payment`, baseline 0)을 분리해 마이그레이션이 충돌하지 않는다. 벤치마크용 `storage-server-spring`(Go 대조군)도 함께 제공한다.
+**학꾸**는 AI 퍼스널컬러 진단을 기반으로 꾸미기 아이템을 개인화 추천하는 커머스·커뮤니티 플랫폼입니다.
+Nginx 뒤에 6개 애플리케이션 서비스가 독립 실행되는 폴리글랏 마이크로서비스 구조이며,
+저는 그중 **결제 시스템, 서비스 분리에 따른 보안 설계, AI 챗봇의 뼈대, 팀 협업 인프라**를 맡았습니다.
 
 ---
 
-## 핵심 서비스 흐름도
+## 협업 방식 — 페어프로그래밍 기반
 
-### 사용자 여정
+이 파트의 상당 부분은 팀원 **천창현**(`rearleg`)과의 **페어프로그래밍**으로 진행했습니다.
+당시 Claude 토큰이 넉넉하지 않아, 한 사람이 모든 코드를 치기보다 **역할을 나눠 개발을 끌고 가는 방식**을 택했습니다.
+
+제가 맡은 역할은 **백엔드 아키텍처 리뷰와 고도화 방향 제시, 그리고 보안 취약점 점검**이었습니다.
+"이 구조에서는 어떤 실패·공격이 가능한가, 어떻게 막을 것인가"를 짚고 그 개선 방향을 프롬프트로 구체화해,
+창현이형의 Claude 세션을 통해 실제 구현을 이어가는 형태로 협업했습니다.
+결제 서버처럼 제가 직접 커밋한 영역도 있고, 스토리지 서버처럼 방향과 보안 설계로 기여한 영역도 있습니다.
+
+> 코드 곳곳의 `M-*` 주석은 이런 리뷰 과정에서 도출된 보안·신뢰성 개선 지점을 표시한 흔적입니다.
+
+---
+
+## 내가 주도한 영역
+
+| 영역 | 역할 | 스택 | 핵심 |
+|------|------|------|------|
+| **결제 서버** `payment-server` | 설계·구현 | Spring Boot 4 · Java 17 · Kafka · Flyway | 토스페이먼츠 연동 + **결제 신뢰성 설계**(Outbox·멱등성·웹훅 서명검증·레이트리밋), TDD |
+| **스토리지 서버 분리·보안** `storage-server` | 아키텍처 방향 제시 · 보안 설계 | Go | Native 언어 분리 판단 + **서비스 분리 보안 위협을 JWT로 차단** |
+| **AI 챗봇 서버** `chatbot-server` | 초기 구축 (0→1) | FastAPI · OpenAI · Vue 3 | FastAPI 스캐폴드 + 프론트 챗봇 UI + Nginx SSE 라우팅 |
+| **협업 인프라** `.github/` | 팀 표준 수립 | GitHub | 이슈·PR 템플릿 |
+
+---
+
+## 1. 결제 서버 (`payment-server`)
+
+### 문제 정의
+
+결제는 "토스 API를 호출한다"가 어려운 게 아니라, **호출 도중 무엇이든 실패할 수 있다**는 게 어렵습니다.
+
+- PG 과금은 성공했는데 우리 DB 커밋 직전에 죽으면? → 돈은 빠졌는데 주문은 없음
+- 사용자가 결제 버튼을 두 번 누르면? → 이중 결제
+- 결제 완료 이벤트를 다른 서비스(포인트 적립 등)에 어떻게 **유실 없이** 전달하나?
+- 위조된 웹훅이 "결제 성공"이라고 거짓말하면?
+
+이 실패 시나리오들을 정리하고, 각각에 대한 방어를 코드로 못박는 방향으로 결제를 **독립 서버로 분리**했습니다.
+
+### 아키텍처
 
 ```mermaid
-flowchart LR
-    subgraph auth["인증 · 온보딩"]
-        A1["회원가입<br>POST /api/auth/signup"]
-        A2["로그인<br>POST /api/auth/login"]
-        A3["온보딩<br>PUT /api/users/me"]
+graph LR
+    FE["프론트<br>토스 결제위젯"]
+
+    subgraph pay["payment-server :8083"]
+        API["PaymentController<br>TossPaymentController"]
+        SVC["PaymentService<br>(intent-first 오케스트레이션)"]
+        GW["PaymentGateway<br>(Mock ↔ Toss 교체)"]
+        OB["Outbox Relay<br>(스케줄러 폴링)"]
+        WH["Webhook<br>(HMAC 서명검증)"]
+        RL["RateLimit<br>(Token Bucket)"]
     end
 
-    subgraph diagnosis["퍼스널컬러 진단"]
-        D1["사진 업로드<br>POST /ai/api/diagnosis"]
-        D2["백그라운드 AI 처리"]
-        D3["결과 확인<br>GET /api/users/me"]
-    end
+    PG[("PostgreSQL<br>Flyway")]
+    KF["Kafka<br>(KRaft)"]
+    TOSS["토스페이먼츠"]
 
-    subgraph commerce["쇼핑 · 결제"]
-        C1["맞춤 추천<br>GET /api/recommendations"]
-        C2["상품 탐색<br>GET /api/products"]
-        C3["장바구니<br>/api/cart/items"]
-        C4["주문<br>POST /api/orders"]
-        C5["결제<br>POST /api/payments"]
-    end
-
-    subgraph community["커뮤니티 · 알림"]
-        M1["글·댓글·좋아요<br>/api/posts"]
-        M2["알림 수신<br>GET /api/notifications"]
-    end
-
-    A1 --> A2 --> A3 --> D1 --> D2 --> D3
-    D3 --> C1 --> C2 --> C3 --> C4 --> C5
-    D3 --> M1 --> M2
-    D2 -.->|완료 알림| M2
-    C5 -.->|결제 완료 알림| M2
+    FE -->|"JWT"| RL --> API --> SVC
+    SVC --> GW --> TOSS
+    SVC --> PG
+    SVC -->|"같은 tx"| OB
+    OB -->|"acks=all"| KF
+    TOSS -->|"결제 상태 통보"| WH --> SVC
 ```
 
-| 단계 | 화면 | 핵심 API | 설명 |
-|---|---|---|---|
-| 1. 가입·로그인 | `/signup`, `/login` | `POST /api/auth/*` | JWT 발급, NORMAL은 온보딩 미완료 시 주요 페이지 접근 차단 |
-| 2. 온보딩 | `/onboarding` | `PUT /api/users/me` | 선호 컬러·스타일 설정, `onboardingCompleted=true` |
-| 3. 진단 요청 | `/diagnosis` | `POST /ai/api/diagnosis` | 즉시 202 반환, 백그라운드 처리 |
-| 4. 결과 확인 | `/my` | `GET /api/users/me` | `personalColor`, `diagnosisImageUrl` 표시 |
-| 5. 추천 | `/recommendations` | `GET /api/recommendations` | 퍼스널컬러·선호·행동 로그 기반 점수 산출 |
-| 6. 상품·장바구니 | `/products`, `/cart` | `GET /api/products`, `/api/cart/items` | 상품 탐색, 장바구니 담기 |
-| 7. 주문·결제 | `/order/new`, `/payments/checkout` | `POST /api/orders`, `POST /api/payments` | 토스페이먼츠 위젯으로 결제 승인, `payment.approved` 수신 시 주문 PAID 전이 |
-| 8. 커뮤니티 | `/community` | `/api/posts`, `/api/comments` | 자유게시판 + 학생증 자랑(연관 상품 첨부), 댓글·좋아요 시 알림 발행 |
-| 9. 알림 | `/notifications` | `GET /api/notifications` | Kafka→Redis 저장분을 폴링으로 조회 |
+### 결제 신뢰성 설계 (핵심)
 
-> 홈 매거진(`/magazine/:id`)과 AI 고객센터 챗봇(우측 하단 FAB → `/chat/stream`)은 위 여정과 별개로 거의 모든 페이지에서 접근할 수 있다.
+각 방어는 실제 코드 주석에 근거가 남아 있습니다.
 
-### 서비스 간 상호작용
+**① Intent-first + 멱등성 — 이중 결제 차단**
+`idempotency_key`(토스 흐름에선 서버 생성 `orderId`)에 UNIQUE 제약을 걸고, 과금 **전에** PENDING 의도를 먼저 커밋합니다.
+동시에 두 번 눌러도 레이스 패자는 UNIQUE 위반으로 걸러져 **승자의 결제를 재조회**합니다. 같은 키·다른 금액이면 409로 거부.
 
-프론트엔드는 Nginx 경로별로 호출 대상이 갈린다 — 비즈니스 API는 **Main Server**(`/api/`), 결제는 **Payment Server**(`/api/payments`), 진단은 **AI Server**(`/ai/`), 챗봇은 **Chatbot Server**(`/chat/`, SSE), 이미지는 **Storage Server**(`/storage/`). 서버 간에는 AI Server가 처리 중 Main·Storage를, Chatbot Server가 고객센터 도구로 Main Server를, Payment Server가 토스페이먼츠를 HTTP로 호출하며, 결제 완료는 Kafka(`payment.approved`)를 통해 Main Server로 비동기 전파된다.
+**② PG 호출은 트랜잭션 밖에서 — 커밋-실패 갭 봉합**
+블로킹 I/O(PG API) 동안 DB 커넥션을 붙잡지 않도록 과금을 트랜잭션 밖에서 호출합니다.
+과금 호출이 실패/타임아웃이면 **절대 롤백하지 않고** PENDING을 유지 — 실제 과금 여부가 불명이므로 웹훅/정산이 최종 상태를 확정합니다.
+
+**③ 낙관적 락(`@Version`) — 동기 정산 vs 웹훅 정산 충돌 해소**
+동기 응답과 웹훅이 같은 결제를 동시에 정산하려 하면 낙관적 락 충돌 → 1회 재시도 → 이미 종료 상태가 보여 **멱등 no-op**으로 확정 결과 반환.
+
+**④ 트랜잭셔널 Outbox — 이벤트 유실 0**
+결제 상태 변경과 "발행할 이벤트"를 **같은 트랜잭션**으로 DB에 기록하고, 별도 릴레이 워커가 폴링해 Kafka로 발행(`acks=all`, 멱등 producer).
+브로커 ack 확인 후에만 SENT 전이(at-least-once). **poison 메시지 격리**: 반복 실패 레코드는 DEAD로 빼내 뒤 이벤트를 막지 않도록 했습니다.
+
+**⑤ 웹훅 서명 검증 — 위조 통보 차단**
+웹훅은 서명이 곧 인증. raw 본문의 HMAC-SHA256을 **상수시간 비교**(타이밍 공격 방지)하고, 32바이트 미만 약한 키는 부팅 시 fail-fast.
+
+**⑥ Token Bucket 레이트리밋 + JWT 인증**
+결제 엔드포인트에 토큰버킷 레이트리밋을 필터로 적용하고 Spring Security + JWT로 요청 주체를 검증합니다.
+
+### 토스 결제위젯 흐름 (prepare → confirm)
 
 ```mermaid
 sequenceDiagram
-    actor User as 사용자
-    participant Nginx
-    participant FE as Frontend
-    participant MS as Main Server
-    participant AI as AI Server
-    participant ST as Storage Server
-    participant PG as PostgreSQL
-    participant KF as Kafka
-    participant RD as Redis
+    participant FE as 프론트(위젯)
+    participant PAY as payment-server
+    participant TOSS as 토스페이먼츠
 
-    User->>FE: 사진 업로드
-    FE->>Nginx: POST /ai/api/diagnosis (JWT)
-    Nginx->>AI: 프록시
-
-    AI->>MS: POST /api/users/me/diagnosis-request
-    Note over MS: NONE → PENDING
-    MS-->>AI: 200
-    AI-->>FE: 202 Accepted
-
-    Note over AI: BackgroundTasks 파이프라인
-    AI->>ST: POST /storage/images?kind=result
-    AI->>MS: PATCH /api/users/me/personal-color
-    Note over MS: PENDING → COMPLETED
-    MS->>PG: 프로필·진단 결과 저장
-    MS->>KF: notification.created 발행
-    KF->>MS: NotificationConsumer
-    MS->>RD: LPUSH user:{id}:notifications
-
-    FE->>Nginx: GET /api/notifications
-    Nginx->>MS: 프록시
-    MS->>RD: 알림 조회
-    MS-->>FE: 알림 목록
+    FE->>PAY: prepare(금액, 참조)
+    PAY->>PAY: 서버 기준 금액으로 PENDING 선커밋 + orderId 발급
+    PAY-->>FE: orderId, amount
+    FE->>TOSS: 결제위젯 승인 요청
+    TOSS-->>FE: successUrl(paymentKey, orderId)
+    FE->>PAY: confirm(paymentKey, orderId, amount)
+    PAY->>PAY: 소유자·저장금액 일치 검증(위변조 방지)
+    PAY->>TOSS: 승인 API (트랜잭션 밖)
+    TOSS-->>PAY: 승인 결과
+    PAY->>PAY: APPROVED/FAILED 확정 + Outbox 기록
+    PAY-->>FE: 결제 결과
 ```
 
-### 진단 상태 머신
+`orderId`를 서버가 생성해 멱등 키로 그대로 쓰기 때문에, 클라이언트 멱등키 충돌·이중 INSERT 레이스가 **구조적으로** 발생하지 않습니다.
+confirm 단계에서 저장 금액 vs 토스 반환 금액을 대조해 **금액 위변조**를 막습니다.
 
-사용자 프로필의 `diagnosisStatus`는 아래 상태 전이를 따른다.
+### 테스트 (TDD)
 
-```mermaid
-stateDiagram-v2
-    [*] --> NONE
-    NONE --> PENDING: POST /diagnosis-request<br>(AI 요청 수락 시)
-    PENDING --> COMPLETED: PATCH /personal-color<br>(AI 성공 시)
-    PENDING --> NONE: DELETE /diagnosis-request<br>(AI 실패 시)
-    COMPLETED --> [*]
-```
-
-### 알림 파이프라인
-
-알림은 실시간 push 없이 **Kafka → Redis → 폴링** 구조로 동작한다.
-
-| 트리거 | `NotificationType` | 수신자 |
-|---|---|---|
-| 진단 완료 | `DIAGNOSIS_COMPLETE` | 본인 |
-| 댓글 작성 | `COMMENT` | 글 작성자 |
-| 좋아요 | `LIKE` | 글 작성자 |
-| 팔로우 | `FOLLOW` | 팔로우 대상 |
-| 찜한 상품 좋아요 | `WISHLIST_LIKE` | 찜 작성자 |
-| 결제 완료(주문) | `ORDER` | 구매자 |
-
-결제(주문) 알림은 `payment-server`가 발행한 `payment.approved` 이벤트를 `main-server`의 `OrderPaymentConsumer`가 구독해, `referenceType="ORDER"`이고 주문이 실제로 `PAID`로 전이된 경우에만 발행한다(at-least-once 중복 수신 시 중복 알림 방지).
-
-```
-Producer (Main Server) → Kafka topic: notification.created
-  → Consumer (NotificationConsumer) → Redis List: user:{userId}:notifications (최대 50건)
-    → Frontend 폴링: GET /api/notifications
-```
-
-### 추천 점수 산출
-
-`RecommendationScoreCalculator`가 아래 요소를 합산해 상품별 점수를 계산하고, 점수 구성 요소를 응답에 포함한다.
-
-| 요소 | 설명 |
-|---|---|
-| 퍼스널컬러 일치도 | 사용자 16종 세부 타입 → 계절 단위 환원 후 상품 태그와 비교 |
-| 선호 스타일·컬러 | 온보딩 시 설정한 `preferredStyles`, `preferredColors` |
-| 행동 로그 | 클릭·찜·장바구니 등 최근 활동 |
-| 상품 인기도 | 리뷰 평점·인기 지표 |
+RED(실패 테스트) → GREEN(구현) 순서로 커밋을 남겼고, 결제 도메인 20여 종의 테스트 클래스로 커버합니다 —
+도메인/상태, 멱등·동시성 API, Outbox 릴레이, 웹훅 서명·JWT·레이트리밋 등 신뢰성 경로를 각각 검증합니다.
 
 ---
 
-## AI 프로세스 흐름도
+## 2. 스토리지 서버 분리 & 보안 (`storage-server`)
 
-### 전체 파이프라인
+이미지 입출력을 담당하던 스토리지 로직을 별도 서비스로 떼어내는 과정에서, 두 가지를 함께 짚었습니다.
 
-사용자가 사진을 올리면 AI Server가 **슬롯 잠금 → 202 즉시 반환 → 백그라운드 처리** 순으로 동작한다. 페이지를 이탈해도 요청은 계속 처리되고, 완료 시 Kafka 알림이 발행된다.
+### ① "왜 Go 네이티브인가" — 분리 언어 선택
 
-```mermaid
-sequenceDiagram
-    participant FE as Frontend
-    participant AI as ai-server
-    participant MS as main-server
-    participant OAI as OpenAI
-    participant ST as storage-server
+스토리지는 CPU 로직보다 **이미지 바이트를 그대로 넘기는 I/O 위주** 작업입니다.
+이 특성에는 JVM보다 **Go 표준 라이브러리 기반의 가벼운 네이티브 서버**가 적합하다고 판단했고,
+실제로 팀은 Spring 구현(`storage-server-spring`)과 벤치마크를 비교해 이 선택을 검증했습니다.
+(비교 결과는 [팀 README](README.team.md)의 벤치마크 섹션 참고)
 
-    FE->>AI: POST /api/diagnosis (image + JWT)
+### ② 서비스를 나누면 생기는 보안 구멍 — JWT로 봉합
 
-    rect rgb(240, 248, 255)
-        Note over AI,MS: 동기 — 요청 스레드
-        AI->>AI: JWT 검증 (_require_auth)
-        AI->>AI: image.read()
-        AI->>MS: POST /api/users/me/diagnosis-request
-        MS-->>AI: 200 (NONE → PENDING)
-        AI-->>FE: 202 Accepted
-    end
+서비스를 분리하면, 원래 하나의 앱 안에 있던 접근 제어가 **네트워크 경계 밖으로 노출**됩니다.
+특히 퍼스널컬러 **진단 결과 이미지**는 아무나 URL만 알면 받아갈 수 있으면 안 되는 민감 자원입니다.
+그래서 스토리지 서버 자체에 인증 경계를 두도록 방향을 잡았습니다.
 
-    rect rgb(255, 248, 240)
-        Note over AI,OAI: 비동기 — BackgroundTasks (_run_pipeline)
-        AI->>AI: resize_for_api() — 리사이즈·JPEG 변환
-        AI->>OAI: images.edit (gpt-image-2)
-        Note over OAI: 템플릿 + 사용자 사진 → 9:16 대시보드 PNG
-        OAI-->>AI: result PNG bytes
-        AI->>ST: POST /storage/images?kind=result
-        ST-->>AI: { id, ownerId, ... }
-        AI->>OAI: responses.create (gpt-5.4-mini)
-        Note over OAI: 결과 이미지에서 "세부 타입" 텍스트 추출
-        OAI-->>AI: "세부 타입: 가을 소프트 (SOFT_AUTUMN)"
-        AI->>AI: extract_personal_color_type() — 16종 ENUM 매칭
-        AI->>MS: PATCH /api/users/me/personal-color
-        Note over MS: COMPLETED + Kafka DIAGNOSIS_COMPLETE
-    end
-```
+- **result 종류 이미지는 유효한 Bearer JWT(HS256)** 를 요구하고, **업로드한 본인만** 내려받을 수 있게 소유자 검증
+- 액세스 토큰과 리프레시 토큰(24h, `type=refresh`)이 시크릿을 공유하더라도, **리프레시 토큰을 액세스 토큰으로 오용하지 못하도록** 구분
+- `JWT_SECRET` 누락 시 result 이미지가 **무인증 공개**되는 무음 보안 구멍이 생기므로, 그 경우 **부팅을 중단**(fail-fast)하도록 설계 (`M-7`)
 
-### 단계별 처리 상세
-
-| # | 단계 | 모듈 | 함수 | sync/async | 설명 |
-|---|---|---|---|---|---|
-| 1 | 슬롯 잠금 | `main_client` | `request_diagnosis_start()` | sync | 중복 요청 시 409 |
-| 2 | 전처리 | `preprocess` | `resize_for_api()` | sync | 긴 변 1024px, RGBA→흰 배경, JPEG q=90 |
-| 3 | 이미지 생성 | `generator` | `generate_analysis_image()` | async | gpt-image-2 `images.edit`, 1024×1824 |
-| 4 | 결과 저장 | `storage` | `upload_result_image()` | async | `kind=result`, JWT→ownerId |
-| 5 | 텍스트 추출 | `vision` | `extract_color_from_image()` | async | gpt-5.4-mini Responses API |
-| 6 | ENUM 파싱 | `ocr` | `extract_personal_color_type()` | sync | 16종 퍼스널컬러 매칭 |
-| 7 | 결과 반영 | `main_client` | `update_user_diagnosis()` | async | personalColor + resultImageUrl |
-
-### OpenAI 모델 사용
-
-| 모델 | API | 입력 | 출력 |
-|---|---|---|---|
-| `gpt-image-2` | `images.edit()` | 템플릿(`result1.png`) + 전처리 JPEG | 9:16 퍼스널컬러 대시보드 PNG |
-| `gpt-5.4-mini` | `responses.create()` | 생성 PNG (base64) | `세부 타입: {한글명} ({ENUM})` 한 줄 |
-
-### 16종 퍼스널컬러 추출 (OCR)
-
-Vision API가 반환한 텍스트에서 `ocr.extract_personal_color_type()`이 아래 우선순위로 ENUM을 결정한다.
-
-1. **직접 ENUM 매칭** — 괄호 안 코드 검색 (예: `SOFT_AUTUMN`)
-2. **한글 라벨 매칭** — 16종 한글명 substring (가장 긴 키워드 우선)
-3. **계절 → 톤 fallback** — 계절 키워드 확정 후 톤 키워드로 세부 타입 추론
-
-| 계절 | 세부 타입 |
-|---|---|
-| 봄 | `LIGHT_SPRING`, `TRUE_SPRING`, `BRIGHT_SPRING`, `CLEAR_SPRING` |
-| 여름 | `LIGHT_SUMMER`, `TRUE_SUMMER`, `SOFT_SUMMER`, `COOL_SUMMER` |
-| 가을 | `SOFT_AUTUMN`, `TRUE_AUTUMN`, `DEEP_AUTUMN`, `MUTED_AUTUMN` |
-| 겨울 | `BRIGHT_WINTER`, `TRUE_WINTER`, `DEEP_WINTER`, `CLEAR_WINTER` |
-
-### 에러 처리
-
-| 실패 지점 | 동작 |
-|---|---|
-| 슬롯 잠금 409 | 즉시 409 반환 (이미 진행 중·완료) |
-| 파이프라인 예외 | `DELETE /api/users/me/diagnosis-request` → NONE 복구 |
-| OCR 매칭 실패 (`None`) | 동일하게 NONE 복구, 사용자 재시도 가능 |
-
-백그라운드 실패 시 클라이언트는 이미 202를 받은 상태이므로, 사용자는 프로필 폴링 또는 알림으로 결과를 확인한다.
+> 제가 전부 구현한 영역은 아닙니다. 다만 "왜 Go로 분리하는가"와 "분리하면 무엇이 위험해지는가"라는
+> 두 결정의 방향을 제가 짚었고, 그 보안 설계(JWT 접근 제어)를 창현이형과 함께 코드로 옮겼습니다.
 
 ---
 
-## 주요 특징
+## 3. AI 챗봇 서버 (`chatbot-server`) — 0→1 구축
 
-### 이미지 트래픽 분리
+프로젝트의 AI 고객센터 챗봇을 **처음부터 세워** 이후 팀이 확장할 토대를 만들었습니다(이슈 #1).
 
-Main Server는 이미지 바이트를 다루지 않는다. Nginx 레벨에서 라우팅이 분리되어 이미지 업로드·다운로드가 비즈니스 서버를 통과하지 않는다.
+- **백엔드**: FastAPI 스캐폴드 — `app/api/chat.py`, `services/chat_service.py`, `config.py`, `main.py`, Dockerfile, pytest 설정
+- **프론트**: 챗봇 진입 UI — `ChatFab.vue`(플로팅 액션 버튼) + `ChatWindow.vue`(대화 창)
+- **인프라**: Nginx `/chat/` 라우팅, docker-compose 서비스 등록, `.env.example`
 
-```
-[진단] Frontend → Nginx → AI Server → (내부) Storage Server
-[상품] Frontend → Nginx → Storage Server
-```
-
-### 퍼스널컬러 결과 이미지 접근 제어
-
-AI가 생성한 퍼스널컬러 진단 결과 이미지(`kind=result`)는 JWT 인증을 통과한 본인만 다운로드할 수 있다.
-
-- 업로드 시 사용자의 JWT를 Storage Server에 전달 → `ownerId`로 메타데이터에 저장
-- 다운로드 시 Bearer 토큰 검증 + `sub` 클레임과 `ownerId` 일치 여부 확인 → 불일치 시 403
-- `JWT_SECRET` 미설정 환경(로컬 개발)에서는 인증 없이 동작하고 경고 로그를 출력한다
-- `raw` 종류 이미지(AI 처리용 원본)는 영향 없음
-
-### 콘텐츠 기반 추천 엔진
-
-퍼스널컬러 일치도, 선호 스타일 일치도, 최근 행동 로그(클릭·찜·장바구니), 상품 인기도·리뷰 점수를 합산해 점수를 산출한다. 점수 구성 요소를 분해해서 응답에 포함하므로 추천 이유를 설명할 수 있다.
-
-### 토스페이먼츠 결제 + 트랜잭셔널 Outbox
-
-결제는 별도 `payment-server`(Spring Boot 4, `:8083`)가 담당하며, **Intent → Charge → Settle** 3단계로 동작한다.
-
-1. **Intent** — 결제를 `PENDING`으로 먼저 기록(별도 트랜잭션). `idempotencyKey` UNIQUE 제약으로 중복 요청을 막는다.
-2. **Charge** — 트랜잭션 밖에서 토스페이먼츠 `POST /v1/payments/confirm`을 호출한다(네트워크 I/O 동안 DB 커넥션 점유 방지). `PaymentGateway` 추상화로 운영은 토스 클라이언트, 테스트는 `MockPaymentGateway`를 끼운다.
-3. **Settle** — 낙관적 락(`@Version`)으로 `PENDING → APPROVED/FAILED` 전이와 Outbox 이벤트 기록을 **한 트랜잭션에서** 원자적으로 처리한다. 동기 요청 경로와 웹훅 경로가 동일한 `PaymentSettler`를 공유해 멱등하게 정산된다.
-
-기록된 Outbox 이벤트는 스케줄러(`OutboxRelay`)가 폴링해 Kafka(`payment.approved`/`payment.failed`)로 at-least-once 발행한다(재시도 횟수 누적, 최대치 초과 시 `DEAD`로 격리). PG 웹훅(`POST /api/payments/webhooks/pg`)은 `PAYMENT_WEBHOOK_SECRET` 기반 HMAC-SHA256 서명을 상수시간 비교로 검증하고, `/api/payments/**`에는 사용자·IP별 토큰 버킷 레이트리밋이 걸린다. 부팅 시 `TossSecretKeyValidator`가 `test_` 샌드박스 키를 거부해(운영 기본 ON) 잘못된 키로 기동하지 못하게 막는다.
-
-### AI 고객센터 챗봇
-
-`chatbot-server`(FastAPI + OpenAI)는 우측 하단 FAB에서 열리는 **학꾸AI** 상담 챗봇이다.
-
-- **SSE 스트리밍** — `POST /chat/stream`이 `text/event-stream`으로 토큰을 흘려보내고, Nginx는 `/chat/` 경로에서 `proxy_buffering off`로 그대로 전달한다.
-- **1시간 대화 기억** — Redis Sorted Set(`chat:history:{user_id}`)에 메시지를 타임스탬프 점수로 저장하고, 1시간 윈도우를 벗어난 메시지는 정리한다. 새로고침하면 `GET /chat/history`로 복원한다.
-- **function-calling 고객센터 도구** — LLM이 필요 시 `get_order_history`(주문 내역), `get_wishlist`(찜 목록), `recommend_products`(맞춤 추천)를 호출하며, 각 도구는 사용자 JWT를 그대로 들고 `main-server` API를 호출한다(최대 3라운드).
-- **상품 카드 임베딩** — `recommend_products` 결과는 `{ "products": [...] }` SSE 이벤트로 내려보내 답변 본문과 함께 클릭 가능한 상품 카드로 렌더링한다. 답변은 마크다운으로 작성된다.
-
-### 마크다운 매거진
-
-큐레이션 카드를 대체한 콘텐츠 기능. `Magazine` 엔티티는 `kicker`·`title`·`subtitle`·`content`(마크다운)·`coverImageUrl`·`displayOrder`·`published`를 가진다. 공개 API는 `GET /api/magazines`(발행분만, `displayOrder` 정렬)·`GET /api/magazines/{id}`, 관리는 `ADMIN` 전용 `/api/admin/magazines` CRUD다. 마크다운 본문에 상품 링크(`/products/{id}`)를 한 줄로 두면 프론트(`/magazine/:id`)가 이를 감지해 넓은 상품 카드로 자동 임베드하고, 임베드 대상 상품 정보를 병렬로 가져온다.
-
-### 커뮤니티 — 학생증 자랑
-
-게시글(`Post`)은 `board`(`GENERAL`/`STUDENT_ID`)로 갈린다. 학생증 자랑 글은 `imageUrl`(쇼케이스 이미지)과 연관 상품(`productIds` → `relatedProducts`)을 첨부할 수 있다. `/community`는 자유게시판과 학생증 자랑 그리드 탭을 제공하고, 상세(`/community/:id`)에는 연관 상품 카드 섹션이 붙으며, 홈에도 학생증 자랑 이미지 그리드 섹션이 노출된다.
-
-### Storage Server Go vs Spring 비교
-
-Go 표준 라이브러리로 구현한 `storage-server`와 동일 API·JWT 정책을 제공하는 Spring Boot 구현체(`storage-server-spring`)를 병렬로 제공한다. 두 구현체 모두 `kind=result` 이미지에 대해 JWT Bearer 검증 및 `ownerId` 기반 다운로드 접근 제어를 적용한다.
-
-## 벤치마크 결과
-
-#### 공정 벤치마크 환경
-
-이전 측정은 Go가 메인 compose 안에서 다른 서비스와 리소스를 공유하고 Spring은 거의 단독 환경이어서 결과가 왜곡되었다. 아래 조건으로 **격리된 공정 환경**을 구성해 재측정했다.
-
-| 항목 | 값 |
-|---|---|
-| Compose | `compose/storage-bench.yml` |
-| JWT | 동일 `JWT_SECRET` (양쪽 활성화) |
-| 리소스 한도 | CPU 2코어, 메모리 512MB (각각) |
-| 포트 | Go `8081`, Spring `8082` |
-| 워크로드 | k6 — 실제 이미지(72KB~865KB) 업로드 → 다운로드 → 삭제 (`kind=raw`) |
-| 스크립트 | `./scripts/benchmark-storage-fair.sh` |
-
-```bash
-# 공정 벤치 (권장)
-VUS=20  DURATION=60s ./scripts/benchmark-storage-fair.sh
-VUS=100 DURATION=60s ./scripts/benchmark-storage-fair.sh
-
-# 전체 아키텍처 부하 (main-server 경유, 비교 참고용)
-./scripts/benchmark-storage.sh
-```
-
-
-부하 시나리오: **20 VU = 평소**, **100 VU = 고부하**. Go 개선(%)은 Spring 대비 — 처리량은 높을수록, 업로드 지연은 낮을수록 유리하다.
-
-**Go vs Spring (평소 · 20 VU)**
-
-| 지표 | Spring | Go | Go 개선 |
-|---|---:|---:|---:|
-| 처리량 (req/s) | 939 | 3,610 | **+284%** |
-| 업로드 avg | 21ms | 5ms | **+76%** |
-| 업로드 p95 | 75ms | 15ms | **+80%** |
-| 업로드 p99 | 86ms | 28ms | **+67%** |
-
-**Go vs Spring (고부하 · 100 VU)**
-
-| 지표 | Spring | Go | Go 개선 |
-|---|---:|---:|---:|
-| 처리량 (req/s) | 926 | 2,340 | **+153%** |
-| 업로드 avg | 127ms | 43ms | **+66%** |
-| 업로드 p95 | 479ms | 132ms | **+72%** |
-| 업로드 p99 | 714ms | 225ms | **+68%** |
-
-평소에도 Go가 처리량 **약 3.8배**, 업로드 p95 **약 80% 빠름**. 고부하에서도 Go 우위는 유지되나(처리량 +153%, 업로드 p95 +72%) Spring은 업로드 p95가 평소 대비 **6배** 늘어나 병목이 업로드에 집중된다. 차이의 주요 원인은 JWT가 아니라 런타임·프레임워크 비용이다.
-
-> `kind=raw` 픽스처만 사용하므로 JWT 검증 경로는 벤치 부하에 포함되지 않는다. JWT 동작은 단위 테스트(`JwtValidatorTest`)로 검증한다.
-
-![관측성](src/dashboard.png)
-
-### 관측성
-
-세 백엔드 모두 `/metrics` 엔드포인트를 노출한다. Prometheus가 메트릭을 수집하고 Grafana 대시보드로 시각화한다.
-
-| 대시보드 | URL | 내용 |
-|---|---|---|
-| Service Overview | http://localhost:3000/d/hakku-overview | 전체 서비스 HTTP·JVM |
-| **Storage 벤치마크** | http://localhost:3000/d/hakku-storage-bench | Go vs Spring 처리량·P95·CPU·메모리 |
-
-```bash
-docker compose -f compose/obs.yml up -d   # Prometheus + Grafana + Jaeger
-```
-
-Jaeger(`http://localhost:16686`)는 기동 가능하나, Storage 서버에는 OpenTelemetry tracing이 아직 연동되지 않아 트레이스 데이터는 없다. Storage 성능 비교는 Grafana/Prometheus를 사용한다.
+> 이후 팀이 이 토대 위에 대화 기억(Redis)·상품 카드 임베딩·SSE 스트리밍을 얹어 "학꾸AI"로 발전시켰습니다.
 
 ---
 
-## 실행
+## 4. 협업 인프라 (`.github/`)
 
-### 데이터셋 준비
+팀의 이슈/PR 작성 표준을 세웠습니다.
 
-> [Google Drive — hakku_dataset.zip 다운로드](https://drive.google.com/file/d/1OtBROPRBg4sGTOoLM843mMl1klmXItge/view?usp=sharing)
+- 이슈 템플릿: **기능 요청 / 버그 리포트 / 리팩터** (`.github/ISSUE_TEMPLATE/`)
+- **Pull Request 템플릿** (`.github/PULL_REQUEST_TEMPLATE.md`)
 
-다운로드 후 `data/` 디렉터리에 압축 해제한다.
+---
 
-### 환경변수 설정
+## 기술 스택 (담당 영역)
+
+| 구분 | 기술 |
+|------|------|
+| 결제 백엔드 | Spring Boot 4.0 · Java 17 · Spring Security · Data JPA · Kafka · Flyway · JJWT · PostgreSQL 16 · Redis 7 |
+| 스토리지 | Go (표준 라이브러리) · JWT(HS256) |
+| 챗봇 백엔드 | FastAPI · Python · OpenAI |
+| 프론트 | Vue 3 · TypeScript · Tailwind |
+| 인프라 | Docker Compose · Nginx · Kafka(KRaft) |
+
+---
+
+## 실행 (담당 서비스 기준)
 
 ```bash
+# 1. 환경변수
 cp .env.example .env
-# 필수: POSTGRES_PASSWORD, JWT_SECRET, OPENAI_API_KEY
-# 결제: PAYMENT_WEBHOOK_SECRET, TOSS_SECRET_KEY (샌드박스 테스트 시
-#       PAYMENT_TOSS_SECRET_KEY_VALIDATION_ENABLED=false), 챗봇: CHATBOT_MODEL(기본 gpt-4o)
-# 프론트 토스 결제위젯 클라이언트키는 frontend/.env 의 VITE_TOSS_CLIENT_KEY 에 설정한다
-```
+# 결제:   PAYMENT_WEBHOOK_SECRET(32B+), TOSS_SECRET_KEY
+#         샌드박스 테스트 시 PAYMENT_TOSS_SECRET_KEY_VALIDATION_ENABLED=false
+# 스토리지: JWT_SECRET(base64) — 미설정 시 result 이미지 보호를 위해 기동 중단
+# 프론트:  토스 클라이언트키 VITE_TOSS_CLIENT_KEY (frontend/.env)
+# 챗봇:   OPENAI_API_KEY, CHATBOT_MODEL(기본 gpt-4o)
 
-### 기동
-
-```bash
-# 전체 스택
+# 2. 전체 스택 기동
 docker compose up -d --build
+#   프록시 http://localhost:19001
+#   결제 API  /api/payments   (payment-server :8083)
+#   스토리지  /storage/        (storage-server)
+#   챗봇      /chat/ (SSE)     (chatbot-server)
 
-# 관측성 스택 (선택)
-docker compose -f compose/obs.yml up -d
+# 3. 결제 서버 테스트
+cd payment-server && ./gradlew test
 ```
 
-Nginx는 host 포트 `19001`로 노출된다(운영은 앞단 Caddy가 `19001`로 프록시).
+---
 
-| 엔드포인트 | 주소 |
-|---|---|
-| 프론트엔드 | http://localhost:19001 |
-| Main API | http://localhost:19001/api |
-| 결제 API | http://localhost:19001/api/payments |
-| AI API | http://localhost:19001/ai |
-| 챗봇 (SSE) | http://localhost:19001/chat |
-| Storage | http://localhost:19001/storage |
-| Grafana | http://localhost:3000 |
-| Jaeger | http://localhost:16686 |
+## 원본 프로젝트
+
+- 팀 저장소: <https://github.com/hakku-ssafy/hakku>
+- 팀 전체 README(백업): [README.team.md](README.team.md)
